@@ -1084,27 +1084,146 @@ def remover_colunas_rtc_vazias(df):
     return df.drop(columns=dropar)
 
 
+# Rotulos traduzidos da aba de resumo.
+# O sufixo "(R$)" marca coluna monetaria e "(%)" marca coluna percentual:
+# o gerador do Excel usa esses marcadores para aplicar a formatacao.
+RESUMO_LABELS = {
+    'CST_IBSCBS': 'CST',
+    'CST_IBSCBS_Desc': 'Situacao Tributaria (CST)',
+    'cClassTrib': 'cClassTrib',
+    'cClassTrib_Desc': 'Classificacao Tributaria (cClassTrib)',
+    'Red_IBS': 'Reducao IBS (%)',
+    'Red_CBS': 'Reducao CBS (%)',
+    'AliqEfet_IBSUF': 'Aliq. Efetiva IBS UF (%)',
+    'AliqEfet_IBSMun': 'Aliq. Efetiva IBS Mun. (%)',
+    'AliqEfet_CBS': 'Aliq. Efetiva CBS (%)',
+    'Itens': 'Qtde. de Itens',
+    'Notas': 'Qtde. de Notas',
+    'vProd': 'Valor dos Produtos (R$)',
+    'vBC': 'Base de Calculo IBS/CBS (R$)',
+    'vIBSUF': 'IBS Estadual - UF (R$)',
+    'vIBSMun': 'IBS Municipal (R$)',
+    'vIBS': 'IBS Total (R$)',
+    'vCBS': 'CBS (R$)',
+    'vIBSMono': 'IBS Monofasico (R$)',
+    'vCBSMono': 'CBS Monofasica (R$)',
+    'vDifIBS': 'IBS Diferido (R$)',
+    'vDifCBS': 'CBS Diferida (R$)',
+    'vDevIBS': 'IBS Devolvido - cashback (R$)',
+    'vDevCBS': 'CBS Devolvida - cashback (R$)',
+    'vCredPresIBS': 'Credito Presumido IBS (R$)',
+    'vCredPresCBS': 'Credito Presumido CBS (R$)',
+    'vIS': 'Imposto Seletivo (R$)',
+    'vTotalRTC': 'Total IBS + CBS (R$)',
+}
+
+# Ordem das colunas na aba de resumo
+RESUMO_ORDEM = [
+    'CST_IBSCBS', 'CST_IBSCBS_Desc', 'cClassTrib', 'cClassTrib_Desc',
+    'Red_IBS', 'Red_CBS', 'AliqEfet_IBSUF', 'AliqEfet_IBSMun', 'AliqEfet_CBS',
+    'Itens', 'Notas', 'vProd', 'vBC',
+    'vIBSUF', 'vIBSMun', 'vIBS', 'vCBS',
+    'vIBSMono', 'vCBSMono',
+    'vDifIBS', 'vDifCBS', 'vDevIBS', 'vDevCBS',
+    'vCredPresIBS', 'vCredPresCBS', 'vIS', 'vTotalRTC',
+]
+
+
 def resumo_rtc(df):
-    """Resumo por CST/cClassTrib do IBS e da CBS."""
+    """Resumo por CST/cClassTrib com reducao de aliquota e valores em R$."""
     if df.empty or 'CST_IBSCBS' not in df.columns:
         return pd.DataFrame()
-    base = df[df['CST_IBSCBS'].astype(str).str.strip() != '']
+    base = df[df['CST_IBSCBS'].astype(str).str.strip() != ''].copy()
     if base.empty:
         return pd.DataFrame()
-    g = base.groupby(['CST_IBSCBS', 'CST_IBSCBS_Desc', 'cClassTrib', 'cClassTrib_Desc'],
-                     dropna=False).agg(
+
+    # Aliquota efetiva: quando ha gRed vale pAliqEfet; senao vale a aliquota cheia.
+    for pref in ('IBSUF', 'IBSMun', 'CBS'):
+        tem_red = (base[f'pRedAliq_{pref}'] != 0) | (base[f'pAliqEfet_{pref}'] != 0)
+        base[f'AliqEfet_{pref}'] = base[f'pAliqEfet_{pref}'].where(tem_red, base[f'p{pref}'])
+
+    # Reducao: prioriza o percentual informado no XML; se ausente, usa a tabela oficial.
+    tab_ibs = pd.to_numeric(base['pRed_Tabela_IBS'], errors='coerce').fillna(0.0)
+    tab_cbs = pd.to_numeric(base['pRed_Tabela_CBS'], errors='coerce').fillna(0.0)
+    base['Red_IBS'] = base['pRedAliq_IBSUF'].where(base['pRedAliq_IBSUF'] != 0, tab_ibs)
+    base['Red_CBS'] = base['pRedAliq_CBS'].where(base['pRedAliq_CBS'] != 0, tab_cbs)
+
+    base['vDifIBS'] = base['vDif_IBSUF'] + base['vDif_IBSMun']
+    base['vDifCBS'] = base['vDif_CBS']
+    base['vDevIBS'] = base['vDevTrib_IBSUF'] + base['vDevTrib_IBSMun']
+    base['vDevCBS'] = base['vDevTrib_CBS']
+    base['vCredPresIBS'] = base['vCredPres_IBS'] + base['vCredPresCondSus_IBS'] \
+        + base['vCredPres_ZFM']
+    base['vCredPresCBS'] = base['vCredPres_CBS'] + base['vCredPresCondSus_CBS']
+
+    # A reducao e a aliquota efetiva entram na chave: itens com percentuais
+    # diferentes viram linhas separadas em vez de serem achatados numa media.
+    chaves = ['CST_IBSCBS', 'CST_IBSCBS_Desc', 'cClassTrib', 'cClassTrib_Desc',
+              'Red_IBS', 'Red_CBS', 'AliqEfet_IBSUF', 'AliqEfet_IBSMun', 'AliqEfet_CBS']
+
+    g = base.groupby(chaves, dropna=False).agg(
         Itens=('vProd', 'size'),
+        Notas=('Chave_NFe', 'nunique'),
         vProd=('vProd', 'sum'),
-        vBC_IBSCBS=('vBC_IBSCBS', 'sum'),
+        vBC=('vBC_IBSCBS', 'sum'),
         vIBSUF=('vIBSUF', 'sum'),
         vIBSMun=('vIBSMun', 'sum'),
         vIBS=('vIBS', 'sum'),
         vCBS=('vCBS', 'sum'),
         vIBSMono=('vTotIBSMonoItem', 'sum'),
         vCBSMono=('vTotCBSMonoItem', 'sum'),
+        vDifIBS=('vDifIBS', 'sum'),
+        vDifCBS=('vDifCBS', 'sum'),
+        vDevIBS=('vDevIBS', 'sum'),
+        vDevCBS=('vDevCBS', 'sum'),
+        vCredPresIBS=('vCredPresIBS', 'sum'),
+        vCredPresCBS=('vCredPresCBS', 'sum'),
         vIS=('vIS', 'sum'),
     ).reset_index()
-    return g.sort_values(['CST_IBSCBS', 'cClassTrib'])
+
+    g['vTotalRTC'] = (g['vIBS'] + g['vCBS'] + g['vIBSMono'] + g['vCBSMono']).round(2)
+    g = g.sort_values(['CST_IBSCBS', 'cClassTrib', 'Red_IBS', 'AliqEfet_IBSUF'])
+    g = g[[c for c in RESUMO_ORDEM if c in g.columns]]
+
+    # linha de totais
+    somaveis = ['Itens', 'vProd', 'vBC', 'vIBSUF', 'vIBSMun', 'vIBS', 'vCBS',
+                'vIBSMono', 'vCBSMono', 'vDifIBS', 'vDifCBS', 'vDevIBS', 'vDevCBS',
+                'vCredPresIBS', 'vCredPresCBS', 'vIS', 'vTotalRTC']
+    total = {c: '' for c in g.columns}
+    total['CST_IBSCBS'] = 'TOTAL'
+    total['CST_IBSCBS_Desc'] = 'Total geral do lote'
+    for c in somaveis:
+        if c in g.columns:
+            total[c] = g[c].sum()
+    if 'Notas' in g.columns:
+        total['Notas'] = base['Chave_NFe'].nunique()
+    g = pd.concat([g, pd.DataFrame([total])], ignore_index=True)
+
+    return g.rename(columns=RESUMO_LABELS)
+
+
+FMT_MOEDA = 'R$ #,##0.00'
+FMT_PERC = '0.0000"%"'
+FMT_PERC_RED = '0.00"%"'
+FMT_QTD = '#,##0.0000'
+
+
+def _tipo_coluna(nome):
+    """Decide o formato numerico de uma coluna pelo nome.
+
+    Rotulos traduzidos usam os marcadores (R$) e (%); as colunas tecnicas
+    do relatorio detalhado caem na heuristica de prefixo.
+    """
+    n = str(nome)
+    if '(R$)' in n:
+        return 'moeda'
+    if '(%)' in n:
+        return 'red' if n.lower().startswith('reducao') else 'perc'
+    if n.startswith(('v', 'Total_', 'Base_', 'Custo_')):
+        return 'moeda'
+    if n.startswith(('q', 'adRem')):
+        return 'qtd'
+    return None
 
 
 def to_excel(df, df_resumo, df_erros, df_diag):
@@ -1112,18 +1231,35 @@ def to_excel(df, df_resumo, df_erros, df_diag):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         wb = writer.book
-        fmt_moeda = wb.add_format({'num_format': '#,##0.00'})
-        fmt_qtd = wb.add_format({'num_format': '#,##0.0000'})
+        fmts = {
+            'moeda': wb.add_format({'num_format': FMT_MOEDA}),
+            'perc': wb.add_format({'num_format': FMT_PERC}),
+            'red': wb.add_format({'num_format': FMT_PERC_RED}),
+            'qtd': wb.add_format({'num_format': FMT_QTD}),
+        }
         fmt_head = wb.add_format({'bold': True, 'bg_color': '#1F3864',
                                   'font_color': 'white', 'border': 1,
                                   'align': 'center', 'valign': 'vcenter',
                                   'text_wrap': True})
+        fmt_total = {
+            'moeda': wb.add_format({'num_format': FMT_MOEDA, 'bold': True,
+                                    'top': 2, 'bg_color': '#DCE6F1'}),
+            'perc': wb.add_format({'num_format': FMT_PERC, 'bold': True,
+                                   'top': 2, 'bg_color': '#DCE6F1'}),
+            'red': wb.add_format({'num_format': FMT_PERC_RED, 'bold': True,
+                                  'top': 2, 'bg_color': '#DCE6F1'}),
+            'qtd': wb.add_format({'num_format': FMT_QTD, 'bold': True,
+                                  'top': 2, 'bg_color': '#DCE6F1'}),
+            None: wb.add_format({'bold': True, 'top': 2, 'bg_color': '#DCE6F1'}),
+        }
 
-        def escrever(dframe, aba):
+        def escrever(dframe, aba, linha_total=False):
             if dframe is None or dframe.empty:
                 return
             dframe.to_excel(writer, index=False, sheet_name=aba, startrow=1, header=False)
             ws = writer.sheets[aba]
+            ultima = len(dframe)  # indice da linha da planilha (cabecalho = 0)
+
             for j, col in enumerate(dframe.columns):
                 ws.write(0, j, col, fmt_head)
                 try:
@@ -1131,23 +1267,50 @@ def to_excel(df, df_resumo, df_erros, df_diag):
                 except (ValueError, TypeError):
                     largura = 12
                 largura = max(min(max(largura, len(str(col))) + 2, 45), 10)
-                nome = str(col)
-                if nome.startswith('v') or nome.startswith('Total') or nome.startswith('Base') \
-                        or nome.startswith('Custo'):
-                    ws.set_column(j, j, largura, fmt_moeda)
-                elif nome.startswith('q') or nome.startswith('adRem'):
-                    ws.set_column(j, j, largura, fmt_qtd)
-                else:
-                    ws.set_column(j, j, largura)
+                tipo = _tipo_coluna(col)
+                ws.set_column(j, j, largura, fmts.get(tipo))
+
+                # reescreve a ultima linha em destaque quando ha total geral
+                if linha_total:
+                    valor = dframe.iloc[-1, j]
+                    fmt = fmt_total.get(tipo, fmt_total[None])
+                    if pd.isna(valor) or valor == '':
+                        ws.write_blank(ultima, j, None, fmt)
+                    elif isinstance(valor, (int, float)):
+                        ws.write_number(ultima, j, float(valor), fmt)
+                    else:
+                        ws.write_string(ultima, j, str(valor), fmt)
+
             ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, len(dframe), len(dframe.columns) - 1)
+            fim = ultima - 1 if linha_total else ultima
+            if fim >= 1:
+                ws.autofilter(0, 0, fim, len(dframe.columns) - 1)
 
         escrever(df, 'Relatorio')
-        escrever(df_resumo, 'Resumo IBS-CBS')
+        escrever(df_resumo, 'Resumo IBS-CBS', linha_total=True)
         escrever(df_diag, 'Divergencias RTC')
         escrever(df_erros, 'Erros')
 
     return output.getvalue()
+
+
+def estilizar_resumo(df_resumo):
+    """Formata o resumo para exibicao na tela (R$ e %)."""
+    if df_resumo is None or df_resumo.empty:
+        return df_resumo
+    regras = {}
+    for col in df_resumo.columns:
+        tipo = _tipo_coluna(col)
+        if tipo == 'moeda':
+            regras[col] = lambda v: '' if v == '' or pd.isna(v) else f'R$ {v:,.2f}'
+        elif tipo == 'red':
+            regras[col] = lambda v: '' if v == '' or pd.isna(v) else f'{v:,.2f}%'
+        elif tipo == 'perc':
+            regras[col] = lambda v: '' if v == '' or pd.isna(v) else f'{v:,.4f}%'
+    try:
+        return df_resumo.style.format(regras)
+    except Exception:
+        return df_resumo
 
 
 # ====================================================================================
@@ -1277,7 +1440,7 @@ if uploaded_files:
                     if df_resumo.empty:
                         st.info('Nenhum item com grupo IBS/CBS informado neste lote.')
                     else:
-                        st.dataframe(df_resumo, use_container_width=True)
+                        st.dataframe(estilizar_resumo(df_resumo), use_container_width=True)
                 with aba3:
                     if df_diag.empty:
                         st.success('Nenhuma divergencia encontrada nos grupos de IBS/CBS.')
